@@ -1,0 +1,248 @@
+name: libretro core
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [demarc]
+    paths-ignore:
+      - '**.md'
+      - 'images/**'
+      - '.github/ISSUE_TEMPLATE/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64
+    # Oldest supported runner, so the core links against an older glibc and
+    # stays loadable on the widest range of RetroArch installs.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential file
+
+      # No platform= on Linux or macOS: the Makefile picks OUTNAME from ISWIN
+      # and the presence of /Applications, and the plain branch is the one that
+      # sets up the x86_64 dynarec.
+      - name: Build core
+        run: make -j"$(nproc)"
+
+      - name: Inspect core
+        run: |
+          file dosbox_pure_libretro.so
+          ls -l dosbox_pure_libretro.so
+          # The core is built with -fvisibility=hidden and stripped, so check
+          # the dynamic symbol table rather than the (empty) static one.
+          nm -D --defined-only dosbox_pure_libretro.so | grep -q ' T retro_run'
+          # C_MMX=1 is the demarc patch to include/config.h; this cputype entry
+          # only exists when it is on, and a core silently built without it
+          # would drop demos that require a Pentium MMX.
+          grep -qa 'Pentium MMX' dosbox_pure_libretro.so
+          cat dosbox_pure_libretro.info
+
+      - name: Upload core
+        uses: actions/upload-artifact@v7
+        with:
+          name: dosbox_pure_libretro-linux-x86_64
+          path: |
+            dosbox_pure_libretro.so
+            dosbox_pure_libretro.info
+          if-no-files-found: error
+
+  macos-arm64:
+    name: macOS arm64
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v6
+
+      # ARCHFLAGS goes into both CFLAGS and LDFLAGS on the macOS branch. Pin it
+      # rather than relying on the host arch so a runner image change cannot
+      # quietly hand demarc an x86_64 core.
+      - name: Build core
+        run: make ARCHFLAGS="-arch arm64" -j"$(sysctl -n hw.ncpu)"
+
+      - name: Inspect core
+        run: |
+          file dosbox_pure_libretro.dylib
+          ls -l dosbox_pure_libretro.dylib
+          # `strip -xS` keeps external symbols, so the entry points are visible.
+          lipo -info dosbox_pure_libretro.dylib | grep -q 'arm64'
+          nm -gU dosbox_pure_libretro.dylib | grep -q '_retro_run'
+          grep -qa 'Pentium MMX' dosbox_pure_libretro.dylib
+          cat dosbox_pure_libretro.info
+
+      - name: Upload core
+        uses: actions/upload-artifact@v7
+        with:
+          name: dosbox_pure_libretro-macos-arm64
+          path: |
+            dosbox_pure_libretro.dylib
+            dosbox_pure_libretro.info
+          if-no-files-found: error
+
+  windows-x64:
+    name: Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v6
+
+      # UCRT64 matches the other demarc cores; the resulting DLL depends on
+      # ucrtbase, which ships with Windows 10 1803+.
+      - name: Set up MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          release: false
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
+
+      # platform=windows is the Makefile's MSYS2 branch — under an MSYS2 shell
+      # the ISWIN autodetection (it looks for a drive letter in `abspath .`)
+      # sees a unix path and would otherwise build a .so. `CXX=g++ -static` is
+      # upstream's own Windows recipe: it keeps libstdc++/libgcc/winpthread out
+      # of the DLL's imports, so the core is a single self-contained file.
+      - name: Build core
+        run: make platform=windows "CXX=g++ -static" -j"$(nproc)"
+
+      - name: Inspect core
+        run: |
+          file dosbox_pure_libretro.dll
+          ls -l dosbox_pure_libretro.dll
+          # The export table, not the symbol table: the DLL is linked stripped.
+          objdump -p dosbox_pure_libretro.dll | grep -q 'retro_run'
+          # Nothing but system DLLs should be imported after `-static`.
+          objdump -p dosbox_pure_libretro.dll | grep 'DLL Name:'
+          ! objdump -p dosbox_pure_libretro.dll | grep -qi 'DLL Name:.*\(libstdc++\|libgcc\|libwinpthread\)'
+          grep -qa 'Pentium MMX' dosbox_pure_libretro.dll
+          cat dosbox_pure_libretro.info
+
+      - name: Upload core
+        uses: actions/upload-artifact@v7
+        with:
+          name: dosbox_pure_libretro-windows-x64
+          path: |
+            dosbox_pure_libretro.dll
+            dosbox_pure_libretro.info
+          if-no-files-found: error
+
+  # Publishes the three cores to a rolling "latest" release, so the demarc app
+  # can fetch them from a URL that never changes. Both of these resolve to the
+  # newest successful build:
+  #   https://github.com/sasq64/dosbox-pure/releases/download/latest/<asset>
+  #   https://github.com/sasq64/dosbox-pure/releases/latest/download/<asset>
+  # manifest.json lists each zip with its size and sha256.
+  publish:
+    name: Publish rolling release
+    needs: [linux-x86_64, macos-arm64, windows-x64]
+    if: github.ref == 'refs/heads/demarc'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v6
+
+      - name: Download built cores
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      # One zip per platform, each holding the core under the plain name
+      # RetroArch expects (dosbox_pure_libretro.so/.dylib/.dll) plus the .info,
+      # so the app can unzip straight into its cores directory.
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          zip_core() {
+            artifact="$1"
+            core="$2"
+            (cd "dist/$artifact" && zip -9 -X "$GITHUB_WORKSPACE/release/$artifact.zip" "$core" dosbox_pure_libretro.info)
+          }
+          zip_core dosbox_pure_libretro-linux-x86_64 dosbox_pure_libretro.so
+          zip_core dosbox_pure_libretro-macos-arm64 dosbox_pure_libretro.dylib
+          zip_core dosbox_pure_libretro-windows-x64 dosbox_pure_libretro.dll
+          ls -l release
+
+      - name: Write manifest.json
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, re, pathlib
+
+          version = "0.0.0"
+          m = re.search(r'DOSBOX_PURE_VERSION_STR\s+"([^"]+)"',
+                        pathlib.Path("dosbox_pure_ver.h").read_text())
+          if m:
+              version = m.group(1)
+
+          assets = {
+              "linux-x86_64": ("dosbox_pure_libretro-linux-x86_64.zip", "dosbox_pure_libretro.so"),
+              "macos-arm64":  ("dosbox_pure_libretro-macos-arm64.zip", "dosbox_pure_libretro.dylib"),
+              "windows-x64":  ("dosbox_pure_libretro-windows-x64.zip", "dosbox_pure_libretro.dll"),
+          }
+          base = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{os.environ['RELEASE_TAG']}"
+
+          manifest = {
+              "version": version,
+              "commit": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "cores": {},
+          }
+          for platform, (name, core) in assets.items():
+              data = pathlib.Path("release", name).read_bytes()
+              manifest["cores"][platform] = {
+                  "file": name,
+                  "core": core,
+                  "url": f"{base}/{name}",
+                  "size": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest(),
+              }
+
+          pathlib.Path("release/manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
+          cat release/manifest.json
+
+      - name: Move the rolling tag
+        run: |
+          set -euo pipefail
+          git tag -f "$RELEASE_TAG" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$RELEASE_TAG"
+
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          NOTES="Rolling libretro core build from \`$GITHUB_SHA\` — see manifest.json for versions and checksums."
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "libretro core (latest)" --notes "$NOTES" --latest
+          else
+            gh release create "$RELEASE_TAG" --title "libretro core (latest)" --notes "$NOTES" --latest
+          fi
+          gh release upload "$RELEASE_TAG" release/* --clobber
