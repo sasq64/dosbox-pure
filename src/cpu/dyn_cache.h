@@ -65,6 +65,27 @@ static inline int nxmunmap(void *addr, size_t)
 #define WUP_RWX_MEM_END 0x01000000
 #endif
 
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <pthread.h>
+// MAP_JIT memory on Apple Silicon is W^X per-thread: a thread must call
+// pthread_jit_write_protect_np(0) before writing to the cache and
+// pthread_jit_write_protect_np(1) before executing it, or it faults. Each
+// thread that touches the cache (the emulation thread, the one that
+// compiles the initial link/run trampolines, ...) tracks its own state,
+// starting unset so the first write always toggles explicitly rather than
+// assuming a default.
+static thread_local bool dyn_cache_jit_writable = false;
+static inline void jit_make_writable() {
+	if (!dyn_cache_jit_writable) { pthread_jit_write_protect_np(0); dyn_cache_jit_writable = true; }
+}
+static inline void jit_make_executable() {
+	if (dyn_cache_jit_writable) { pthread_jit_write_protect_np(1); dyn_cache_jit_writable = false; }
+}
+#else
+static inline void jit_make_writable() {}
+static inline void jit_make_executable() {}
+#endif
+
 class CodePageHandlerDynRec;	// forward
 
 // basic cache block representation
@@ -607,6 +628,7 @@ static void cache_closeblock(void) {
 
 // place an 8bit value into the cache
 static INLINE void cache_addb(Bit8u val,const Bit8u *pos) {
+	jit_make_writable();
 #ifdef HAVE_LIBNX
 	Bit8u* rwPos = (Bit8u*)((intptr_t)pos - (intptr_t)jit_rx_addr + (intptr_t)jit_rw_addr);
 	*rwPos=val;
@@ -622,6 +644,7 @@ static INLINE void cache_addb(Bit8u val) {
 
 // place a 16bit value into the cache
 static INLINE void cache_addw(Bit16u val,const Bit8u *pos) {
+	jit_make_writable();
 #ifdef HAVE_LIBNX
 	Bit16u* rwPos = (Bit16u*)((intptr_t)pos - (intptr_t)jit_rx_addr + (intptr_t)jit_rw_addr);
 	*rwPos=val;
@@ -637,6 +660,7 @@ static INLINE void cache_addw(Bit16u val) {
 
 // place a 32bit value into the cache
 static INLINE void cache_addd(Bit32u val,const Bit8u *pos) {
+	jit_make_writable();
 #ifdef HAVE_LIBNX
 	Bit32u* rwPos = (Bit32u*)((intptr_t)pos - (intptr_t)jit_rx_addr + (intptr_t)jit_rw_addr);
 	*rwPos=val;
@@ -652,6 +676,7 @@ static INLINE void cache_addd(Bit32u val) {
 
 // place a 64bit value into the cache
 static INLINE void cache_addq(Bit64u val,const Bit8u *pos) {
+	jit_make_writable();
 #ifdef HAVE_LIBNX
 	Bit64u* rwPos = (Bit64u*)((intptr_t)pos - (intptr_t)jit_rx_addr + (intptr_t)jit_rw_addr);
 	*rwPos=val;
@@ -722,6 +747,13 @@ static void cache_init(bool enable) {
 #elif defined(WIIU)
 			cache_code_start_ptr=(Bit8u*)WUP_RWX_MEM_BASE;
 			//memset(cache_code_start_ptr, 0, (WUP_RWX_MEM_END - WUP_RWX_MEM_BASE));
+#elif defined(__APPLE__)
+			// malloc + mprotect(PROT_EXEC) silently produces a page the CPU
+			// refuses to execute on Apple Silicon; MAP_JIT is the only way
+			// to get RWX anonymous memory there.
+			cache_code_start_ptr=(Bit8u*)mmap(NULL,CACHE_TOTAL+CACHE_MAXSIZE+PAGESIZE_TEMP-1+PAGESIZE_TEMP,
+				PROT_READ|PROT_WRITE|PROT_EXEC,MAP_JIT|MAP_ANON|MAP_PRIVATE,-1,0);
+			if (cache_code_start_ptr==MAP_FAILED) cache_code_start_ptr=NULL;
 #else
 			cache_code_start_ptr=(Bit8u*)malloc(CACHE_TOTAL+CACHE_MAXSIZE+PAGESIZE_TEMP-1+PAGESIZE_TEMP);
 #endif
@@ -733,7 +765,7 @@ static void cache_init(bool enable) {
 			cache_code_link_blocks=cache_code;
 			cache_code=cache_code+PAGESIZE_TEMP;
 
-#if (C_HAVE_MPROTECT)
+#if (C_HAVE_MPROTECT) && !defined(__APPLE__)
 			if(mprotect(cache_code_link_blocks,CACHE_TOTAL+CACHE_MAXSIZE+PAGESIZE_TEMP,PROT_WRITE|PROT_READ|PROT_EXEC))
 				LOG_MSG("Setting execute permission on the code cache has failed");
 #endif
@@ -761,6 +793,11 @@ static void cache_init(bool enable) {
 //		link_blocks[1].cache.start=cache.pos;
 		dyn_run_code();
 #endif
+		// no cache_block_closing() call for this trampoline on the little
+		// endian path (see the WORDS_BIGENDIAN branch below for why other
+		// platforms need one); still need to leave the writing thread in
+		// the executable JIT state before returning to the caller.
+		jit_make_executable();
 #else
 		core_dynrec.runcode=(BlockReturn (*)(const Bit8u*))cache.pos;
 		// can use op to PAGESIZE_TEMP-64 bytes
@@ -822,6 +859,8 @@ static void cache_close(void) {
 		sceKernelFreeMemBlock(sceBlock);
 		sceBlock = 0;
 #elif defined(WIIU)
+#elif defined(__APPLE__)
+		munmap(cache_code_start_ptr,CACHE_TOTAL+CACHE_MAXSIZE+PAGESIZE_TEMP-1+PAGESIZE_TEMP);
 #else
 		free(cache_code_start_ptr);
 #endif

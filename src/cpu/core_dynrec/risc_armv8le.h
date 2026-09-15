@@ -1144,6 +1144,16 @@ static void cache_block_closing(const Bit8u* block_start,Bitu block_size) {
 	FlushInstructionCache(hProcess, block_start, block_size);
 }
 #else
+#if defined(__APPLE__)
+#include <libkern/OSCacheControl.h>
+static void cache_flush(char* start, char* end)
+{
+    // macOS traps EL0 reads of CTR_EL0 (SIGILL) unlike Linux, so the
+    // generic ARMv8 path below can't be used here; sys_icache_invalidate
+    // is the sanctioned way to make freshly JIT'd code visible on Darwin.
+    sys_icache_invalidate(start, (size_t)(end - start));
+}
+#else
 static void cache_flush(char* start, char* end)
 {
     // Don't rely on GCC's __clear_cache implementation, as it caches
@@ -1175,11 +1185,12 @@ static void cache_flush(char* start, char* end)
     __asm__ volatile("dsb ish" : : : "memory");
     __asm__ volatile("isb" : : : "memory");
 }
-
+#endif
 
 static void cache_block_closing(const Bit8u* block_start,Bitu block_size) {
 	//flush cache
 	cache_flush((char *)block_start, (char *)(block_start+block_size));
+	jit_make_executable();
 }
 #endif
 
