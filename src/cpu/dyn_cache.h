@@ -902,5 +902,9 @@ static void DBPSerialize_cache_reset(void) {
 		cache.pos=&cache_code_link_blocks[32];
 		link_blocks[1].cache.start=cache.pos;
 		dyn_return(BR_Link2,false);
+		// same as the little endian branch in cache_init(): these writes
+		// don't go through cache_block_closing(), so the writing thread
+		// needs to be put back into the executable JIT state by hand.
+		jit_make_executable();
 	}
 }
